@@ -1,11 +1,13 @@
-import serial
 import csv
-import time
-from datetime import datetime
-from collections import deque
-from pathlib import Path
 import re
+import serial
 import statistics
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 
 # =========================================================
 # ----------- HOST CALIBRATION (PLATEN MASS) --------------
@@ -43,23 +45,6 @@ POS_X1_MM = 152.4
 CLAMP_POS_MM_MIN = 0.0
 CLAMP_POS_MM_MAX = 152.4
 
-def affine_from_2pt(x0, y0, x1, y1):
-    if x1 == x0:
-        raise ValueError("Calibration points invalid: x1 == x0")
-    m = (y1 - y0) / (x1 - x0)
-    b = y0 - m * x0
-    return m, b
-
-POS_M, POS_B = affine_from_2pt(POS_V0, POS_X0_MM, POS_V1, POS_X1_MM)
-
-def potV_to_mm(pot_v: float) -> float:
-    mm = POS_M * pot_v + POS_B
-    if CLAMP_POS_MM_MIN is not None:
-        mm = max(CLAMP_POS_MM_MIN, mm)
-    if CLAMP_POS_MM_MAX is not None:
-        mm = min(CLAMP_POS_MM_MAX, mm)
-    return mm
-
 # =========================================================
 # ---------------- USER SETTINGS ----------------
 PORT = "COM4"
@@ -90,6 +75,27 @@ REARM_MARGIN = 0.15
 REARM_HOLD = 0.50
 # ------------------------------------------------
 
+
+def affine_from_2pt(x0, y0, x1, y1):
+    if x1 == x0:
+        raise ValueError("Calibration points invalid: x1 == x0")
+    m = (y1 - y0) / (x1 - x0)
+    b = y0 - m * x0
+    return m, b
+
+
+POS_M, POS_B = affine_from_2pt(POS_V0, POS_X0_MM, POS_V1, POS_X1_MM)
+
+
+def potV_to_mm(pot_v: float) -> float:
+    mm = POS_M * pot_v + POS_B
+    if CLAMP_POS_MM_MIN is not None:
+        mm = max(CLAMP_POS_MM_MIN, mm)
+    if CLAMP_POS_MM_MAX is not None:
+        mm = min(CLAMP_POS_MM_MAX, mm)
+    return mm
+
+
 def safe_parse(line: str):
     """Expected Arduino CSV: time_ms,pot_raw,pot_V,force_in"""
     parts = [p.strip() for p in line.split(",")]
@@ -103,6 +109,7 @@ def safe_parse(line: str):
         return t_ms, pot_raw, pot_v, force_in
     except ValueError:
         return None
+
 
 def next_test_path(out_dir: Path, prefix: str, num_digits: int) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -121,8 +128,10 @@ def next_test_path(out_dir: Path, prefix: str, num_digits: int) -> Path:
     name = f"{prefix}{n_next:0{num_digits}d}.csv" if n_next < 10**num_digits else f"{prefix}{n_next}.csv"
     return out_dir / name
 
+
 def print_status(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
 
 def read_n_samples_force_in(ser, n):
     """Read n valid parsed samples and return list of (t_ms, force_in, pot_v)."""
@@ -142,11 +151,37 @@ def read_n_samples_force_in(ser, n):
         out.append((t_ms, force_in, pot_v))
     return out
 
+
 def robust_mean(x):
     """Robust center estimate to reduce impact of spikes."""
     if len(x) < 5:
         return sum(x) / len(x)
     return statistics.median(x)
+
+
+def make_plot(csv_path: Path, trial_xy, test_number: str):
+    """Write a load-displacement plot (force_N_tared vs pos_mm) next to the CSV."""
+    if not trial_xy:
+        print_status("Plot skipped (no samples recorded in trial).")
+        return
+
+    x_mm = [p for p, _ in trial_xy]
+    y_n = [f for _, f in trial_xy]
+
+    png_path = csv_path.with_suffix(".png")
+
+    plt.figure(figsize=(8, 5), dpi=130)
+    plt.plot(x_mm, y_n, linewidth=2)
+    plt.title(f"Load Test {test_number}: Force vs Position")
+    plt.xlabel("Position (mm)")
+    plt.ylabel("Force (N)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(png_path)
+    plt.close()
+
+    print_status(f"PLOT SAVED -> {png_path}")
+
 
 # ---------------- OPEN SERIAL ----------------
 ser = serial.Serial(PORT, BAUD, timeout=1)
@@ -196,7 +231,7 @@ if HOST_CAL_ENABLE:
         c_off_mean = robust_mean(off_counts)
         print_status(f"OFF counts (robust mean) = {c_off_mean:.3f}")
 
-    delta_counts = (c_on_mean - c_off_mean)
+    delta_counts = c_on_mean - c_off_mean
     if abs(delta_counts) < MIN_DELTA_COUNTS:
         raise RuntimeError(
             f"Calibration failed: |delta_counts|={abs(delta_counts):.1f} < MIN_DELTA_COUNTS={MIN_DELTA_COUNTS}. "
@@ -228,13 +263,15 @@ if HOST_CAL_ENABLE:
 else:
     print_status("HOST CAL disabled. Using force_in as-is (assumed N already).")
 
+
 def force_in_to_N_tared(force_in: float) -> float:
     """Convert incoming force_in to Newtons and subtract tare baseline."""
     if not HOST_CAL_ENABLE:
         return force_in
     # Force is proportional to (counts - off_baseline) with chosen sign
-    N = force_sign * ((force_in - c_off_mean) / counts_per_N) - tare_force_N
-    return N
+    n_force = force_sign * ((force_in - c_off_mean) / counts_per_N) - tare_force_N
+    return n_force
+
 
 # ---------------- STATE MACHINE BUFFERS ----------------
 prebuf = deque(maxlen=5000)
@@ -252,12 +289,22 @@ post_until_ms = None
 
 trial_file = None
 trial_writer = None
+trial_csv_path = None
+trial_test_number = None
+trial_xy = []
 
 last_t_ms = None
 
+
 def start_trial():
     global trial_file, trial_writer, state, t_stop_below, post_until_ms
+    global trial_csv_path, trial_test_number, trial_xy
+
     outpath = next_test_path(OUT_DIR, FILE_PREFIX, NUM_DIGITS)
+    trial_csv_path = outpath
+    trial_test_number = outpath.stem.replace(FILE_PREFIX, "")
+    trial_xy = []
+
     trial_file = open(outpath, "w", newline="")
     trial_writer = csv.writer(trial_file)
 
@@ -285,6 +332,7 @@ def start_trial():
         for row in prebuf:
             if row[1] >= t_start:
                 trial_writer.writerow(row)
+                trial_xy.append((row[4], row[6]))
 
     trial_file.flush()
     print_status(f"TRIAL START -> {outpath}")
@@ -292,18 +340,30 @@ def start_trial():
     t_stop_below = 0.0
     post_until_ms = None
 
+
 def end_trial():
     global trial_file, trial_writer, state, t_trigger_above, t_stop_below, post_until_ms
+    global trial_csv_path, trial_test_number, trial_xy
+
     if trial_file:
         trial_file.flush()
         trial_file.close()
+
+    if trial_csv_path is not None:
+        make_plot(trial_csv_path, trial_xy, trial_test_number)
+
     trial_file = None
     trial_writer = None
+    trial_csv_path = None
+    trial_test_number = None
+    trial_xy = []
+
     state = "LOCKOUT"
     t_trigger_above = 0.0
     t_stop_below = 0.0
     post_until_ms = None
     print_status("TRIAL END -> LOCKOUT (waiting for return-to-baseline)")
+
 
 try:
     while True:
@@ -349,11 +409,11 @@ try:
 
         # Convert units
         pos_mm = potV_to_mm(v_smooth)
-        force_N_tared = force_in_to_N_tared(force_in) if HOST_CAL_ENABLE else force_in
+        force_n_tared = force_in_to_N_tared(force_in) if HOST_CAL_ENABLE else force_in
 
         row = [
             pc_time, t_ms, pot_raw, v_smooth, pos_mm,
-            force_in, force_N_tared, dvdt,
+            force_in, force_n_tared, dvdt,
             (counts_per_N if counts_per_N is not None else ""),
             tare_force_N,
             PLATEN_MASS_G,
@@ -383,6 +443,7 @@ try:
                 continue
 
             trial_writer.writerow(row)
+            trial_xy.append((pos_mm, force_n_tared))
 
             if abs(dvdt) < STOP_SLOPE:
                 t_stop_below += dt_s
